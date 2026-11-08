@@ -22,12 +22,18 @@ const MAX_DM_LENGTH = 256;
 const RATE_LIMIT_COUNT = 20;
 const RATE_LIMIT_WINDOW_MS = 30 * 1000;
 const CLIENT_TIMEOUT_MS = 75 * 1000;
+const TRACK_INACTIVITY_TIMEOUT_MS = 30 * 1000;
+const TRACK_RATE_LIMIT_PER_SEC = 3;
 
 // In-Memory State
 const users = new Map(); // lowercase -> { username, tokenHash, createdAt }
 const friendships = new Set(); // "userA:userB" (alphabetically sorted)
 const pendingRequests = new Set(); // "from:to"
 let queuedDms = []; // [{ id, from, to, text, ts, expiresAt }]
+
+// Tracking State
+const pendingTrackRequests = new Set(); // "requester:target"
+const activeTrackSessions = new Map(); // "sender->viewer" -> { sender, viewer, lastPosTime, posTimestamps: [] }
 
 // Active Connections
 const activeClients = new Map(); // sessionId -> session
@@ -154,7 +160,7 @@ function pruneExpiredDms() {
   }
 }
 
-// Client Session Helper
+// Client Session Helpers
 function getSessionByUsername(username) {
   const sessionId = usernameToSessionId.get(username.toLowerCase());
   if (!sessionId) return undefined;
@@ -175,6 +181,76 @@ function broadcastFriendUpdate(fromUsername, online, server) {
     if (friendSession && friendSession.ws.readyState === 1) {
       friendSession.ws.send(msg);
     }
+  }
+}
+
+function sendToUser(username, obj) {
+  const session = getSessionByUsername(username);
+  if (session && session.ws.readyState === 1) {
+    session.ws.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
+}
+
+function endTrackingBetween(stopper, other) {
+  const lowerStopper = stopper.toLowerCase();
+  const lowerOther = other.toLowerCase();
+  const k1 = `${lowerStopper}->${lowerOther}`;
+  const k2 = `${lowerOther}->${lowerStopper}`;
+
+  activeTrackSessions.delete(k1);
+  activeTrackSessions.delete(k2);
+
+  pendingTrackRequests.delete(`${lowerStopper}:${lowerOther}`);
+  pendingTrackRequests.delete(`${lowerOther}:${lowerStopper}`);
+
+  sendToUser(other, { type: 'track_stopped', by: stopper });
+}
+
+function endTrackingSessionsForUser(username) {
+  const lower = username.toLowerCase();
+  const toDelete = [];
+
+  for (const [key, session] of activeTrackSessions.entries()) {
+    if (session.sender.toLowerCase() === lower) {
+      sendToUser(session.viewer, { type: 'track_stopped', by: session.sender });
+      toDelete.push(key);
+    } else if (session.viewer.toLowerCase() === lower) {
+      sendToUser(session.sender, { type: 'track_stopped', by: session.viewer });
+      toDelete.push(key);
+    }
+  }
+
+  for (const k of toDelete) {
+    activeTrackSessions.delete(k);
+  }
+
+  const pendingToDelete = [];
+  for (const req of pendingTrackRequests) {
+    const [u1, u2] = req.split(':');
+    if (u1 === lower || u2 === lower) {
+      pendingToDelete.push(req);
+    }
+  }
+  for (const p of pendingToDelete) {
+    pendingTrackRequests.delete(p);
+  }
+}
+
+function pruneExpiredTrackSessions() {
+  const now = Date.now();
+  const toDelete = [];
+
+  for (const [key, session] of activeTrackSessions.entries()) {
+    if (now - session.lastPosTime > TRACK_INACTIVITY_TIMEOUT_MS) {
+      sendToUser(session.viewer, { type: 'track_stopped', by: session.sender });
+      toDelete.push(key);
+    }
+  }
+
+  for (const k of toDelete) {
+    activeTrackSessions.delete(k);
   }
 }
 
@@ -221,7 +297,7 @@ wss.on('connection', (ws) => {
     invisible: false,
     server: null,
     lastActive: Date.now(),
-    messageTimestamps: [],
+    dmTimestamps: [],
   };
 
   activeClients.set(sessionId, session);
@@ -257,7 +333,7 @@ wss.on('connection', (ws) => {
 
     const type = msg.type;
 
-    // Ping
+    // Ping - Does NOT count toward DM rate limits
     if (type === 'ping') {
       send({ type: 'pong' });
       return;
@@ -328,16 +404,17 @@ wss.on('connection', (ws) => {
       session.server = serverVal;
       usernameToSessionId.set(lowerName, session.id);
 
-      // Friends list for welcome message
+      // Friends list for welcome message with accurate presence
       const friendsList = [];
       const friendNames = getFriendsOf(session.username);
       for (const fName of friendNames) {
         const fSession = getSessionByUsername(fName);
-        if (fSession && !fSession.invisible) {
-          friendsList.push({ username: fName, online: true, server: fSession.server });
-        } else {
-          friendsList.push({ username: fName, online: false, server: null });
-        }
+        const isOnline = Boolean(fSession && !fSession.invisible);
+        friendsList.push({
+          username: fName,
+          online: isOnline,
+          server: isOnline ? fSession.server : null,
+        });
       }
 
       // Pending incoming friend requests
@@ -424,19 +501,32 @@ wss.on('connection', (ws) => {
         friendships.add(makeFriendKey(currentName, to));
         scheduleSave();
 
-        send({ type: 'friend_added', username: to });
         const toSession = getSessionByUsername(to);
-        if (toSession && !toSession.invisible) {
-          send({ type: 'friend_update', username: to, online: true, server: toSession.server });
-        }
+        const isToOnline = Boolean(toSession && !toSession.invisible);
+        const toServer = isToOnline ? toSession.server : null;
+        const isCurrentOnline = !session.invisible;
+        const currentServer = isCurrentOnline ? session.server : null;
 
-        if (toSession) {
-          toSession.ws.send(JSON.stringify({ type: 'friend_added', username: currentName }));
-          if (!session.invisible) {
-            toSession.ws.send(
-              JSON.stringify({ type: 'friend_update', username: currentName, online: true, server: session.server })
-            );
-          }
+        send({ type: 'friend_added', username: to, online: isToOnline, server: toServer });
+        send({ type: 'friend_update', username: to, online: isToOnline, server: toServer });
+
+        if (toSession && toSession.ws.readyState === 1) {
+          toSession.ws.send(
+            JSON.stringify({
+              type: 'friend_added',
+              username: currentName,
+              online: isCurrentOnline,
+              server: currentServer,
+            })
+          );
+          toSession.ws.send(
+            JSON.stringify({
+              type: 'friend_update',
+              username: currentName,
+              online: isCurrentOnline,
+              server: currentServer,
+            })
+          );
         }
         return;
       }
@@ -470,19 +560,32 @@ wss.on('connection', (ws) => {
       friendships.add(makeFriendKey(currentName, from));
       scheduleSave();
 
-      send({ type: 'friend_added', username: from });
       const fromSession = getSessionByUsername(from);
-      if (fromSession && !fromSession.invisible) {
-        send({ type: 'friend_update', username: from, online: true, server: fromSession.server });
-      }
+      const isFromOnline = Boolean(fromSession && !fromSession.invisible);
+      const fromServer = isFromOnline ? fromSession.server : null;
+      const isCurrentOnline = !session.invisible;
+      const currentServer = isCurrentOnline ? session.server : null;
 
-      if (fromSession) {
-        fromSession.ws.send(JSON.stringify({ type: 'friend_added', username: currentName }));
-        if (!session.invisible) {
-          fromSession.ws.send(
-            JSON.stringify({ type: 'friend_update', username: currentName, online: true, server: session.server })
-          );
-        }
+      send({ type: 'friend_added', username: from, online: isFromOnline, server: fromServer });
+      send({ type: 'friend_update', username: from, online: isFromOnline, server: fromServer });
+
+      if (fromSession && fromSession.ws.readyState === 1) {
+        fromSession.ws.send(
+          JSON.stringify({
+            type: 'friend_added',
+            username: currentName,
+            online: isCurrentOnline,
+            server: currentServer,
+          })
+        );
+        fromSession.ws.send(
+          JSON.stringify({
+            type: 'friend_update',
+            username: currentName,
+            online: isCurrentOnline,
+            server: currentServer,
+          })
+        );
       }
       return;
     }
@@ -506,6 +609,8 @@ wss.on('connection', (ws) => {
       if (friendships.has(key)) {
         friendships.delete(key);
         scheduleSave();
+
+        endTrackingBetween(currentName, target);
 
         send({ type: 'friend_removed', username: target });
 
@@ -532,15 +637,16 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // Rate limit check: 20 per 30 seconds
+      // Rate limit check: 20 per 30 seconds (sliding window on dmTimestamps only)
       const now = Date.now();
-      session.messageTimestamps = session.messageTimestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-      if (session.messageTimestamps.length >= RATE_LIMIT_COUNT) {
-        send({ type: 'error', code: 'rate_limited', message: 'Rate limit exceeded (max 20 messages per 30s)' });
+      if (!session.dmTimestamps) session.dmTimestamps = [];
+      session.dmTimestamps = session.dmTimestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+      if (session.dmTimestamps.length >= RATE_LIMIT_COUNT) {
+        send({ type: 'error', code: 'rate_limited', message: 'Rate limit exceeded (max 20 messages per 30s)', id });
         send({ type: 'dm_ack', id, status: 'failed' });
         return;
       }
-      session.messageTimestamps.push(now);
+      session.dmTimestamps.push(now);
 
       // Must be friends
       if (!areFriends(currentName, to)) {
@@ -605,6 +711,8 @@ wss.on('connection', (ws) => {
         send({ type: 'error', code: 'not_friends', message: 'Tracking requires accepted friends' });
         return;
       }
+      const reqKey = `${currentName.toLowerCase()}:${to.toLowerCase()}`;
+      pendingTrackRequests.add(reqKey);
       const target = getSessionByUsername(to);
       if (target && target.ws.readyState === 1) {
         target.ws.send(JSON.stringify({ type: 'track_request_in', from: currentName }));
@@ -618,6 +726,21 @@ wss.on('connection', (ws) => {
         send({ type: 'error', code: 'not_friends', message: 'Not friends' });
         return;
       }
+      const reqKey = `${from.toLowerCase()}:${currentName.toLowerCase()}`;
+      if (!pendingTrackRequests.has(reqKey)) {
+        return;
+      }
+      pendingTrackRequests.delete(reqKey);
+
+      // Create active tracking session: currentName gives consent for from to view their position
+      const sessionKey = `${currentName.toLowerCase()}->${from.toLowerCase()}`;
+      activeTrackSessions.set(sessionKey, {
+        sender: currentName,
+        viewer: from,
+        lastPosTime: Date.now(),
+        posTimestamps: [],
+      });
+
       const target = getSessionByUsername(from);
       if (target && target.ws.readyState === 1) {
         target.ws.send(JSON.stringify({ type: 'track_accepted', by: currentName }));
@@ -631,6 +754,9 @@ wss.on('connection', (ws) => {
         send({ type: 'error', code: 'not_friends', message: 'Not friends' });
         return;
       }
+      const reqKey = `${from.toLowerCase()}:${currentName.toLowerCase()}`;
+      pendingTrackRequests.delete(reqKey);
+
       const target = getSessionByUsername(from);
       if (target && target.ws.readyState === 1) {
         target.ws.send(JSON.stringify({ type: 'track_declined', by: currentName }));
@@ -644,10 +770,70 @@ wss.on('connection', (ws) => {
         send({ type: 'error', code: 'not_friends', message: 'Not friends' });
         return;
       }
-      const target = getSessionByUsername(withUser);
-      if (target && target.ws.readyState === 1) {
-        target.ws.send(JSON.stringify({ type: 'track_stopped', by: currentName }));
+      endTrackingBetween(currentName, withUser);
+      return;
+    }
+
+    // Tracking Position
+    if (type === 'track_pos') {
+      const withUser = typeof msg.with === 'string' ? msg.with.trim() : '';
+      if (!isValidUsername(withUser)) {
+        send({ type: 'error', code: 'invalid', message: 'Invalid "with" username' });
+        return;
       }
+
+      const x = msg.x;
+      const y = msg.y;
+      const z = msg.z;
+      const dim = msg.dim;
+      const health = msg.health;
+      const maxHealth = msg.maxHealth;
+      const serverVal = msg.server;
+
+      if (
+        typeof x !== 'number' || !Number.isFinite(x) ||
+        typeof y !== 'number' || !Number.isFinite(y) ||
+        typeof z !== 'number' || !Number.isFinite(z) ||
+        typeof dim !== 'string' || dim.length < 1 || dim.length > 64 ||
+        typeof health !== 'number' || !Number.isFinite(health) || health < 0 || health > 10000 ||
+        typeof maxHealth !== 'number' || !Number.isFinite(maxHealth) || maxHealth <= 0 || maxHealth > 10000 ||
+        (serverVal !== null && (typeof serverVal !== 'string' || serverVal.length > 128))
+      ) {
+        send({ type: 'error', code: 'invalid', message: 'Invalid track_pos data types or bounds' });
+        return;
+      }
+
+      const sessionKey = `${currentName.toLowerCase()}->${withUser.toLowerCase()}`;
+      const trackSession = activeTrackSessions.get(sessionKey);
+      if (!trackSession) {
+        send({ type: 'error', code: 'invalid', message: 'No active tracking session in that direction' });
+        return;
+      }
+
+      // 3 per second rate limit
+      const now = Date.now();
+      trackSession.posTimestamps = trackSession.posTimestamps.filter((t) => now - t < 1000);
+      if (trackSession.posTimestamps.length >= TRACK_RATE_LIMIT_PER_SEC) {
+        send({ type: 'error', code: 'rate_limited', message: 'Tracking position rate limit exceeded (max 3 per second)' });
+        return;
+      }
+
+      trackSession.posTimestamps.push(now);
+      trackSession.lastPosTime = now;
+
+      // Relay without storing to disk
+      sendToUser(withUser, {
+        type: 'track_pos_in',
+        from: currentName,
+        x,
+        y,
+        z,
+        dim,
+        health,
+        maxHealth,
+        server: serverVal ?? null,
+        ts: now,
+      });
       return;
     }
 
@@ -657,13 +843,13 @@ wss.on('connection', (ws) => {
   const cleanupSession = () => {
     activeClients.delete(sessionId);
     if (session.username) {
-      const lower = session.username.toLowerCase();
+      const canonicalUser = session.username;
+      const lower = canonicalUser.toLowerCase();
       if (usernameToSessionId.get(lower) === sessionId) {
         usernameToSessionId.delete(lower);
       }
-      if (!session.invisible) {
-        broadcastFriendUpdate(session.username, false, null);
-      }
+      broadcastFriendUpdate(canonicalUser, false, null);
+      endTrackingSessionsForUser(canonicalUser);
     }
   };
 
@@ -680,17 +866,20 @@ setInterval(() => {
       session.ws.terminate();
       activeClients.delete(sessionId);
       if (session.username) {
-        const lower = session.username.toLowerCase();
+        const canonicalUser = session.username;
+        const lower = canonicalUser.toLowerCase();
         if (usernameToSessionId.get(lower) === sessionId) {
           usernameToSessionId.delete(lower);
         }
-        if (!session.invisible) {
-          broadcastFriendUpdate(session.username, false, null);
-        }
+        broadcastFriendUpdate(canonicalUser, false, null);
+        endTrackingSessionsForUser(canonicalUser);
       }
     }
   }
 }, 10000);
+
+// Prune inactive track sessions every 5 seconds (30s timeout)
+setInterval(pruneExpiredTrackSessions, 5000);
 
 // Prune expired DMs hourly
 setInterval(pruneExpiredDms, 60 * 60 * 1000);
