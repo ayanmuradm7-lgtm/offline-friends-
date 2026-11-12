@@ -24,9 +24,10 @@ const RATE_LIMIT_WINDOW_MS = 30 * 1000;
 const CLIENT_TIMEOUT_MS = 75 * 1000;
 const TRACK_INACTIVITY_TIMEOUT_MS = 30 * 1000;
 const TRACK_RATE_LIMIT_PER_SEC = 3;
+const PROFILE_RATE_LIMIT_MS = 10 * 1000;
 
 // In-Memory State
-const users = new Map(); // lowercase -> { username, tokenHash, createdAt }
+const users = new Map(); // lowercase -> { username, tokenHash, createdAt, avatar?, lastProfileTime? }
 const friendships = new Set(); // "userA:userB" (alphabetically sorted)
 const pendingRequests = new Set(); // "from:to"
 let queuedDms = []; // [{ id, from, to, text, ts, expiresAt }]
@@ -43,6 +44,39 @@ const usernameToSessionId = new Map(); // lowercase -> sessionId
 function isValidUsername(name) {
   if (typeof name !== 'string') return false;
   return /^[a-zA-Z0-9_]{3,16}$/.test(name);
+}
+
+function validateAvatar(avatar) {
+  if (!avatar || typeof avatar !== 'object' || Array.isArray(avatar)) {
+    return null;
+  }
+  const kind = avatar.kind;
+
+  if (kind === 'default') {
+    const id = avatar.id;
+    if (typeof id !== 'string' || !/^[a-z]{1,16}$/.test(id)) {
+      return null;
+    }
+    return { kind: 'default', id };
+  }
+
+  if (kind === 'pixels') {
+    const data = avatar.data;
+    if (typeof data !== 'string' || data.length > 256 || !/^[A-Za-z0-9+/=]+$/.test(data)) {
+      return null;
+    }
+    try {
+      const buf = Buffer.from(data, 'base64');
+      if (buf.length !== 192 || buf.toString('base64') !== data) {
+        return null;
+      }
+      return { kind: 'pixels', data };
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 function hashToken(token, existingSalt) {
@@ -160,7 +194,7 @@ function pruneExpiredDms() {
   }
 }
 
-// Client Session Helpers
+// Client Session Helper
 function getSessionByUsername(username) {
   const sessionId = usernameToSessionId.get(username.toLowerCase());
   if (!sessionId) return undefined;
@@ -169,12 +203,17 @@ function getSessionByUsername(username) {
 
 function broadcastFriendUpdate(fromUsername, online, server) {
   const friends = getFriendsOf(fromUsername);
-  const msg = JSON.stringify({
+  const userRecord = users.get(fromUsername.toLowerCase());
+  const updateObj = {
     type: 'friend_update',
     username: fromUsername,
     online,
     server,
-  });
+  };
+  if (userRecord && userRecord.avatar) {
+    updateObj.avatar = userRecord.avatar;
+  }
+  const msg = JSON.stringify(updateObj);
 
   for (const friendName of friends) {
     const friendSession = getSessionByUsername(friendName);
@@ -404,17 +443,22 @@ wss.on('connection', (ws) => {
       session.server = serverVal;
       usernameToSessionId.set(lowerName, session.id);
 
-      // Friends list for welcome message with accurate presence
+      // Friends list for welcome message with accurate presence and optional avatar
       const friendsList = [];
       const friendNames = getFriendsOf(session.username);
       for (const fName of friendNames) {
         const fSession = getSessionByUsername(fName);
         const isOnline = Boolean(fSession && !fSession.invisible);
-        friendsList.push({
+        const fRecord = users.get(fName.toLowerCase());
+        const item = {
           username: fName,
           online: isOnline,
           server: isOnline ? fSession.server : null,
-        });
+        };
+        if (fRecord && fRecord.avatar) {
+          item.avatar = fRecord.avatar;
+        }
+        friendsList.push(item);
       }
 
       // Pending incoming friend requests
@@ -507,26 +551,35 @@ wss.on('connection', (ws) => {
         const isCurrentOnline = !session.invisible;
         const currentServer = isCurrentOnline ? session.server : null;
 
-        send({ type: 'friend_added', username: to, online: isToOnline, server: toServer });
-        send({ type: 'friend_update', username: to, online: isToOnline, server: toServer });
+        const toRecord = users.get(to.toLowerCase());
+        const currentRecord = users.get(currentName.toLowerCase());
+
+        const toAdded = { type: 'friend_added', username: to, online: isToOnline, server: toServer };
+        if (toRecord && toRecord.avatar) toAdded.avatar = toRecord.avatar;
+        send(toAdded);
+
+        const toUpdate = { type: 'friend_update', username: to, online: isToOnline, server: toServer };
+        if (toRecord && toRecord.avatar) toUpdate.avatar = toRecord.avatar;
+        send(toUpdate);
 
         if (toSession && toSession.ws.readyState === 1) {
-          toSession.ws.send(
-            JSON.stringify({
-              type: 'friend_added',
-              username: currentName,
-              online: isCurrentOnline,
-              server: currentServer,
-            })
-          );
-          toSession.ws.send(
-            JSON.stringify({
-              type: 'friend_update',
-              username: currentName,
-              online: isCurrentOnline,
-              server: currentServer,
-            })
-          );
+          const curAdded = {
+            type: 'friend_added',
+            username: currentName,
+            online: isCurrentOnline,
+            server: currentServer,
+          };
+          if (currentRecord && currentRecord.avatar) curAdded.avatar = currentRecord.avatar;
+          toSession.ws.send(JSON.stringify(curAdded));
+
+          const curUpdate = {
+            type: 'friend_update',
+            username: currentName,
+            online: isCurrentOnline,
+            server: currentServer,
+          };
+          if (currentRecord && currentRecord.avatar) curUpdate.avatar = currentRecord.avatar;
+          toSession.ws.send(JSON.stringify(curUpdate));
         }
         return;
       }
@@ -566,26 +619,35 @@ wss.on('connection', (ws) => {
       const isCurrentOnline = !session.invisible;
       const currentServer = isCurrentOnline ? session.server : null;
 
-      send({ type: 'friend_added', username: from, online: isFromOnline, server: fromServer });
-      send({ type: 'friend_update', username: from, online: isFromOnline, server: fromServer });
+      const fromRecord = users.get(from.toLowerCase());
+      const currentRecord = users.get(currentName.toLowerCase());
+
+      const fromAdded = { type: 'friend_added', username: from, online: isFromOnline, server: fromServer };
+      if (fromRecord && fromRecord.avatar) fromAdded.avatar = fromRecord.avatar;
+      send(fromAdded);
+
+      const fromUpdate = { type: 'friend_update', username: from, online: isFromOnline, server: fromServer };
+      if (fromRecord && fromRecord.avatar) fromUpdate.avatar = fromRecord.avatar;
+      send(fromUpdate);
 
       if (fromSession && fromSession.ws.readyState === 1) {
-        fromSession.ws.send(
-          JSON.stringify({
-            type: 'friend_added',
-            username: currentName,
-            online: isCurrentOnline,
-            server: currentServer,
-          })
-        );
-        fromSession.ws.send(
-          JSON.stringify({
-            type: 'friend_update',
-            username: currentName,
-            online: isCurrentOnline,
-            server: currentServer,
-          })
-        );
+        const curAdded = {
+          type: 'friend_added',
+          username: currentName,
+          online: isCurrentOnline,
+          server: currentServer,
+        };
+        if (currentRecord && currentRecord.avatar) curAdded.avatar = currentRecord.avatar;
+        fromSession.ws.send(JSON.stringify(curAdded));
+
+        const curUpdate = {
+          type: 'friend_update',
+          username: currentName,
+          online: isCurrentOnline,
+          server: currentServer,
+        };
+        if (currentRecord && currentRecord.avatar) curUpdate.avatar = currentRecord.avatar;
+        fromSession.ws.send(JSON.stringify(curUpdate));
       }
       return;
     }
@@ -594,7 +656,7 @@ wss.on('connection', (ws) => {
     if (type === 'friend_decline') {
       const from = typeof msg.from === 'string' ? msg.from.trim() : '';
       const reqKey = `${from.toLowerCase()}:${currentName.toLowerCase()}`;
-      if (pendingRequests.has(reqKey)) {
+      if (!pendingRequests.has(reqKey)) {
         pendingRequests.delete(reqKey);
         scheduleSave();
       }
@@ -834,6 +896,41 @@ wss.on('connection', (ws) => {
         server: serverVal ?? null,
         ts: now,
       });
+      return;
+    }
+
+    // Avatar Profile
+    if (type === 'profile') {
+      const avatar = validateAvatar(msg.avatar);
+      if (!avatar) {
+        send({ type: 'error', code: 'invalid', message: 'Invalid avatar payload' });
+        return;
+      }
+
+      const userRecord = users.get(currentName.toLowerCase());
+      if (!userRecord) {
+        send({ type: 'error', code: 'invalid', message: 'User record not found' });
+        return;
+      }
+
+      const now = Date.now();
+      if (userRecord.lastProfileTime && now - userRecord.lastProfileTime < PROFILE_RATE_LIMIT_MS) {
+        send({
+          type: 'error',
+          code: 'rate_limited',
+          message: 'Profile update rate limit exceeded (max 1 per 10 seconds)',
+        });
+        return;
+      }
+
+      userRecord.avatar = avatar;
+      userRecord.lastProfileTime = now;
+      scheduleSave();
+
+      // Send friend_update {username, online, server, avatar} to accepted friends
+      const isOnline = !session.invisible;
+      const currentServer = isOnline ? session.server : null;
+      broadcastFriendUpdate(currentName, isOnline, currentServer);
       return;
     }
 
