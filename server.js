@@ -25,6 +25,10 @@ const CLIENT_TIMEOUT_MS = 75 * 1000;
 const TRACK_INACTIVITY_TIMEOUT_MS = 30 * 1000;
 const TRACK_RATE_LIMIT_PER_SEC = 3;
 const PROFILE_RATE_LIMIT_MS = 10 * 1000;
+const HOST_UPDATE_RATE_LIMIT_MS = 2000;
+const INVITE_RATE_LIMIT_COUNT = 10;
+const INVITE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const JOIN_INTENT_TTL_MS = 120 * 1000; // 2 minutes
 
 // In-Memory State
 const users = new Map(); // lowercase -> { username, tokenHash, createdAt, avatar?, lastProfileTime? }
@@ -36,6 +40,12 @@ let queuedDms = []; // [{ id, from, to, text, ts, expiresAt }]
 const pendingTrackRequests = new Set(); // "requester:target"
 const activeTrackSessions = new Map(); // "sender->viewer" -> { sender, viewer, lastPosTime, posTimestamps: [] }
 
+// World Hosting & Invites State (In-Memory Only)
+const activeHostSessions = new Map(); // sid -> session
+const hostUserToSid = new Map(); // lowercase(host) -> sid
+const activeInvites = new Map(); // `${sid}:${lowercase(to)}` -> invite
+let joinIntents = []; // [{ username, sid, timestamp }]
+
 // Active Connections
 const activeClients = new Map(); // sessionId -> session
 const usernameToSessionId = new Map(); // lowercase -> sessionId
@@ -44,6 +54,33 @@ const usernameToSessionId = new Map(); // lowercase -> sessionId
 function isValidUsername(name) {
   if (typeof name !== 'string') return false;
   return /^[a-zA-Z0-9_]{3,16}$/.test(name);
+}
+
+function parseAllowedSuffixes(envVal) {
+  const raw = envVal !== undefined ? envVal : process.env.ALLOWED_ADDRESS_SUFFIXES;
+  const str = raw || '.e4mc.link';
+  return str
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isValidHostAddress(address, customSuffixes) {
+  if (typeof address !== 'string') return false;
+  const trimmed = address.trim();
+  if (trimmed.length === 0 || trimmed.length > 100) return false;
+  if (trimmed !== trimmed.toLowerCase()) return false;
+
+  const suffixes = customSuffixes || parseAllowedSuffixes();
+  for (const suf of suffixes) {
+    const normSuf = suf.startsWith('.') ? suf : `.${suf}`;
+    const escapedSuffix = normSuf.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`^[a-z0-9-]+(\\.[a-z0-9-]+)*${escapedSuffix}$`);
+    if (regex.test(trimmed)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function validateAvatar(avatar) {
@@ -293,6 +330,123 @@ function pruneExpiredTrackSessions() {
   }
 }
 
+// World Hosting Lifecycle Helpers
+function getHostingInfo(session) {
+  return {
+    sid: session.sid,
+    world: session.world,
+    mcVersion: session.mcVersion,
+    players: session.players,
+    maxPlayers: session.maxPlayers,
+    names: [...session.names],
+    visibility: session.visibility,
+    onlineMode: session.onlineMode,
+  };
+}
+
+function canUserSeeHosting(hostName, viewerName) {
+  if (hostName.toLowerCase() === viewerName.toLowerCase()) return true;
+  const sid = hostUserToSid.get(hostName.toLowerCase());
+  if (!sid) return false;
+  const session = activeHostSessions.get(sid);
+  if (!session) return false;
+  if (!areFriends(hostName, viewerName)) return false;
+
+  if (session.visibility === 'ask') {
+    return true;
+  }
+  if (session.visibility === 'invite') {
+    return activeInvites.has(`${session.sid}:${viewerName.toLowerCase()}`);
+  }
+  return false; // 'hidden'
+}
+
+function broadcastHostingUpdate(hostName, hosting) {
+  const friends = getFriendsOf(hostName);
+  for (const friendName of friends) {
+    const session = getSessionByUsername(friendName);
+    if (session && session.ws.readyState === 1) {
+      if (!hosting) {
+        session.ws.send(JSON.stringify({ type: 'hosting_update', username: hostName, hosting: null }));
+      } else if (canUserSeeHosting(hostName, friendName)) {
+        session.ws.send(JSON.stringify({ type: 'hosting_update', username: hostName, hosting }));
+      }
+    }
+  }
+}
+
+function stopHostSession(hostName, reason) {
+  const lower = hostName.toLowerCase();
+  const sid = hostUserToSid.get(lower);
+  if (!sid) return;
+  const session = activeHostSessions.get(sid);
+
+  // Cancel all active invites for this sid
+  const toRemove = [];
+  for (const [key, invite] of activeInvites.entries()) {
+    if (invite.sid === sid) {
+      toRemove.push(key);
+      sendToUser(invite.to, {
+        type: 'invite_cancelled',
+        sid,
+        from: session ? session.host : hostName,
+        reason,
+      });
+      if (session && session.visibility === 'invite') {
+        sendToUser(invite.to, {
+          type: 'hosting_update',
+          username: hostName,
+          hosting: null,
+        });
+      }
+    }
+  }
+  for (const k of toRemove) {
+    activeInvites.delete(k);
+  }
+
+  activeHostSessions.delete(sid);
+  hostUserToSid.delete(lower);
+
+  // Send hosting_update { username, hosting: null } to accepted friends
+  const friends = getFriendsOf(hostName);
+  for (const f of friends) {
+    sendToUser(f, { type: 'hosting_update', username: hostName, hosting: null });
+  }
+}
+
+function pruneExpiredInvites() {
+  const now = Date.now();
+  const toRemove = [];
+  for (const [key, invite] of activeInvites.entries()) {
+    if (now >= invite.expires) {
+      toRemove.push(key);
+      sendToUser(invite.to, {
+        type: 'invite_cancelled',
+        sid: invite.sid,
+        from: invite.from,
+        reason: 'expired',
+      });
+      const session = activeHostSessions.get(invite.sid);
+      if (session && session.visibility === 'invite') {
+        sendToUser(invite.to, {
+          type: 'hosting_update',
+          username: invite.from,
+          hosting: null,
+        });
+      }
+    }
+  }
+  for (const k of toRemove) {
+    activeInvites.delete(k);
+  }
+}
+
+function pruneExpiredIntents() {
+  const now = Date.now();
+  joinIntents = joinIntents.filter((i) => now - i.timestamp <= JOIN_INTENT_TTL_MS);
+}
+
 // HTTP Server
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -372,7 +526,7 @@ wss.on('connection', (ws) => {
 
     const type = msg.type;
 
-    // Ping - Does NOT count toward DM rate limits
+    // Ping
     if (type === 'ping') {
       send({ type: 'pong' });
       return;
@@ -443,7 +597,7 @@ wss.on('connection', (ws) => {
       session.server = serverVal;
       usernameToSessionId.set(lowerName, session.id);
 
-      // Friends list for welcome message with accurate presence and optional avatar
+      // Friends list for welcome message with accurate presence, optional avatar, and hosting
       const friendsList = [];
       const friendNames = getFriendsOf(session.username);
       for (const fName of friendNames) {
@@ -457,6 +611,13 @@ wss.on('connection', (ws) => {
         };
         if (fRecord && fRecord.avatar) {
           item.avatar = fRecord.avatar;
+        }
+        const fSid = hostUserToSid.get(fName.toLowerCase());
+        if (fSid) {
+          const fHostSession = activeHostSessions.get(fSid);
+          if (fHostSession && canUserSeeHosting(fName, session.username)) {
+            item.hosting = getHostingInfo(fHostSession);
+          }
         }
         friendsList.push(item);
       }
@@ -481,13 +642,40 @@ wss.on('connection', (ws) => {
         scheduleSave();
       }
 
+      // Still-valid queued invites for this user while offline
+      pruneExpiredInvites();
+      const now = Date.now();
+      const validInvitesForUser = [];
+      for (const invite of activeInvites.values()) {
+        if (invite.to.toLowerCase() === lowerName && now < invite.expires) {
+          const currentSid = hostUserToSid.get(invite.from.toLowerCase());
+          if (currentSid === invite.sid) {
+            validInvitesForUser.push({
+              sid: invite.sid,
+              from: invite.from,
+              world: invite.world,
+              address: invite.address,
+              mcVersion: invite.mcVersion,
+              players: invite.players,
+              maxPlayers: invite.maxPlayers,
+              onlineMode: invite.onlineMode,
+              expires: invite.expires,
+            });
+          }
+        }
+      }
+
       // Send welcome
-      send({
+      const welcomeMsg = {
         type: 'welcome',
         friends: friendsList,
         pending_in: pendingIn,
         queued_dms: queuedForUser,
-      });
+      };
+      if (validInvitesForUser.length > 0) {
+        welcomeMsg.invites = validInvitesForUser;
+      }
+      send(welcomeMsg);
 
       // Broadcast presence if not invisible
       if (!session.invisible) {
@@ -656,7 +844,7 @@ wss.on('connection', (ws) => {
     if (type === 'friend_decline') {
       const from = typeof msg.from === 'string' ? msg.from.trim() : '';
       const reqKey = `${from.toLowerCase()}:${currentName.toLowerCase()}`;
-      if (!pendingRequests.has(reqKey)) {
+      if (pendingRequests.has(reqKey)) {
         pendingRequests.delete(reqKey);
         scheduleSave();
       }
@@ -673,6 +861,26 @@ wss.on('connection', (ws) => {
         scheduleSave();
 
         endTrackingBetween(currentName, target);
+
+        // Cancel any invites between them
+        const toRemoveInvites = [];
+        for (const [k, inv] of activeInvites.entries()) {
+          if (
+            (inv.from.toLowerCase() === currentName.toLowerCase() && inv.to.toLowerCase() === target.toLowerCase()) ||
+            (inv.from.toLowerCase() === target.toLowerCase() && inv.to.toLowerCase() === currentName.toLowerCase())
+          ) {
+            toRemoveInvites.push(k);
+            sendToUser(inv.to, {
+              type: 'invite_cancelled',
+              sid: inv.sid,
+              from: inv.from,
+              reason: 'revoked',
+            });
+          }
+        }
+        for (const k of toRemoveInvites) {
+          activeInvites.delete(k);
+        }
 
         send({ type: 'friend_removed', username: target });
 
@@ -934,7 +1142,528 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    send({ type: 'error', code: 'invalid', message: `Unknown message type "${type}"` });
+    // World Hosting & Invites
+    if (type === 'host_start') {
+      const sid = msg.sid;
+      if (typeof sid !== 'string' || !/^[a-z0-9]{12}$/.test(sid)) {
+        send({ type: 'error', code: 'invalid', message: 'sid must be 12 characters [a-z0-9]' });
+        return;
+      }
+
+      const world = msg.world;
+      if (typeof world !== 'string' || world.length < 1 || world.length > 32) {
+        send({ type: 'error', code: 'invalid', message: 'world must be 1-32 characters' });
+        return;
+      }
+
+      const mcVersion = msg.mcVersion;
+      if (typeof mcVersion !== 'string' || mcVersion.length < 1 || mcVersion.length > 16) {
+        send({ type: 'error', code: 'invalid', message: 'mcVersion must be 1-16 characters' });
+        return;
+      }
+
+      const address = msg.address;
+      if (!isValidHostAddress(address)) {
+        send({ type: 'error', code: 'invalid', message: 'Invalid host address format or suffix' });
+        return;
+      }
+
+      const players = msg.players;
+      const maxPlayers = msg.maxPlayers;
+      if (
+        typeof players !== 'number' || !Number.isInteger(players) || players < 0 || players > 100 ||
+        typeof maxPlayers !== 'number' || !Number.isInteger(maxPlayers) || maxPlayers < 0 || maxPlayers > 100
+      ) {
+        send({ type: 'error', code: 'invalid', message: 'players and maxPlayers must be integers 0-100' });
+        return;
+      }
+
+      const onlineMode = msg.onlineMode;
+      if (typeof onlineMode !== 'boolean') {
+        send({ type: 'error', code: 'invalid', message: 'onlineMode must be a boolean' });
+        return;
+      }
+
+      const visibility = msg.visibility;
+      if (visibility !== 'invite' && visibility !== 'ask' && visibility !== 'hidden') {
+        send({ type: 'error', code: 'invalid', message: 'visibility must be "invite", "ask", or "hidden"' });
+        return;
+      }
+
+      const names = msg.names;
+      if (!Array.isArray(names) || names.length > 16 || !names.every(isValidUsername)) {
+        send({ type: 'error', code: 'invalid', message: 'names must be an array of at most 16 valid usernames' });
+        return;
+      }
+
+      const lowerHost = currentName.toLowerCase();
+
+      // Rule 1: host_start replaces an older session of the same user (cancel its invites with reason "stopped")
+      if (hostUserToSid.has(lowerHost)) {
+        stopHostSession(currentName, 'stopped');
+      }
+
+      const hostSession = {
+        sid,
+        host: currentName,
+        world,
+        mcVersion,
+        address,
+        players,
+        maxPlayers,
+        onlineMode,
+        visibility,
+        names: [...names],
+        createdAt: Date.now(),
+        inviteTimestamps: [],
+      };
+
+      activeHostSessions.set(sid, hostSession);
+      hostUserToSid.set(lowerHost, sid);
+
+      // Rule 5: Send hosting_update on host_start
+      broadcastHostingUpdate(currentName, getHostingInfo(hostSession));
+      return;
+    }
+
+    if (type === 'host_update') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const lowerHost = currentName.toLowerCase();
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      if (!activeSid || activeSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      const hostSession = activeHostSessions.get(sid);
+      if (!hostSession) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      // Rate limit: 1 per 2 seconds
+      const now = Date.now();
+      if (hostSession.lastHostUpdateTime && now - hostSession.lastHostUpdateTime < HOST_UPDATE_RATE_LIMIT_MS) {
+        send({ type: 'error', code: 'rate_limited', message: 'host_update rate limit exceeded (max 1 per 2 seconds)' });
+        return;
+      }
+
+      const players = msg.players;
+      const maxPlayers = msg.maxPlayers;
+      if (
+        typeof players !== 'number' || !Number.isInteger(players) || players < 0 || players > 100 ||
+        typeof maxPlayers !== 'number' || !Number.isInteger(maxPlayers) || maxPlayers < 0 || maxPlayers > 100
+      ) {
+        send({ type: 'error', code: 'invalid', message: 'players and maxPlayers must be integers 0-100' });
+        return;
+      }
+
+      const visibility = msg.visibility;
+      if (visibility !== 'invite' && visibility !== 'ask' && visibility !== 'hidden') {
+        send({ type: 'error', code: 'invalid', message: 'visibility must be "invite", "ask", or "hidden"' });
+        return;
+      }
+
+      const names = msg.names;
+      if (!Array.isArray(names) || names.length > 16 || !names.every(isValidUsername)) {
+        send({ type: 'error', code: 'invalid', message: 'names must be an array of at most 16 valid usernames' });
+        return;
+      }
+
+      const oldVisibility = hostSession.visibility;
+      hostSession.players = players;
+      hostSession.maxPlayers = maxPlayers;
+      hostSession.names = [...names];
+      hostSession.visibility = visibility;
+      hostSession.lastHostUpdateTime = now;
+
+      for (const inv of activeInvites.values()) {
+        if (inv.sid === sid) {
+          inv.players = players;
+          inv.maxPlayers = maxPlayers;
+        }
+      }
+
+      // If visibility changed from 'ask' to 'invite' or 'hidden', notify friends who can no longer see it
+      if (oldVisibility === 'ask' && visibility !== 'ask') {
+        const friends = getFriendsOf(currentName);
+        for (const f of friends) {
+          if (!canUserSeeHosting(currentName, f)) {
+            sendToUser(f, { type: 'hosting_update', username: currentName, hosting: null });
+          }
+        }
+      }
+
+      // Rule 5: Send hosting_update on host_update
+      broadcastHostingUpdate(currentName, getHostingInfo(hostSession));
+      return;
+    }
+
+    if (type === 'host_stop') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const lowerHost = currentName.toLowerCase();
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      if (!activeSid || activeSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      stopHostSession(currentName, 'stopped');
+      return;
+    }
+
+    if (type === 'invite') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const lowerHost = currentName.toLowerCase();
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      if (!activeSid || activeSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      const hostSession = activeHostSessions.get(sid);
+      if (!hostSession) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      // Rule 3: Cap invites per host at 10 per minute (error "rate_limited")
+      const now = Date.now();
+      if (!hostSession.inviteTimestamps) hostSession.inviteTimestamps = [];
+      hostSession.inviteTimestamps = hostSession.inviteTimestamps.filter((t) => now - t < INVITE_RATE_LIMIT_WINDOW_MS);
+      if (hostSession.inviteTimestamps.length >= INVITE_RATE_LIMIT_COUNT) {
+        send({ type: 'error', code: 'rate_limited', message: 'Invite rate limit exceeded (max 10 per minute)' });
+        return;
+      }
+      hostSession.inviteTimestamps.push(now);
+
+      const to = msg.to;
+      if (!Array.isArray(to) || to.length < 1 || to.length > 20) {
+        send({ type: 'error', code: 'invalid', message: 'to must be an array of 1-20 usernames' });
+        return;
+      }
+
+      let ttl = 600;
+      if (msg.ttl !== undefined) {
+        if (typeof msg.ttl !== 'number' || !Number.isInteger(msg.ttl) || msg.ttl < 60 || msg.ttl > 1800) {
+          send({ type: 'error', code: 'invalid', message: 'ttl must be an integer between 60 and 1800 seconds' });
+          return;
+        }
+        ttl = msg.ttl;
+      }
+
+      const expires = now + ttl * 1000;
+      const results = [];
+
+      for (const rawName of to) {
+        if (typeof rawName !== 'string' || !isValidUsername(rawName) || !users.has(rawName.toLowerCase())) {
+          results.push({ username: String(rawName), status: 'unknown' });
+          continue;
+        }
+
+        const targetCanonical = getCanonicalUsername(rawName);
+        if (!areFriends(currentName, targetCanonical)) {
+          results.push({ username: targetCanonical, status: 'not_friends' });
+          continue;
+        }
+
+        const inviteKey = `${sid}:${targetCanonical.toLowerCase()}`;
+        const inviteObj = {
+          sid,
+          from: currentName,
+          to: targetCanonical,
+          world: hostSession.world,
+          address: hostSession.address,
+          mcVersion: hostSession.mcVersion,
+          players: hostSession.players,
+          maxPlayers: hostSession.maxPlayers,
+          onlineMode: hostSession.onlineMode,
+          expires,
+        };
+        activeInvites.set(inviteKey, inviteObj);
+
+        const targetSession = getSessionByUsername(targetCanonical);
+        if (targetSession && targetSession.ws.readyState === 1) {
+          targetSession.ws.send(
+            JSON.stringify({
+              type: 'invite_in',
+              sid,
+              from: currentName,
+              world: hostSession.world,
+              address: hostSession.address,
+              mcVersion: hostSession.mcVersion,
+              players: hostSession.players,
+              maxPlayers: hostSession.maxPlayers,
+              onlineMode: hostSession.onlineMode,
+              expires,
+            })
+          );
+          if (hostSession.visibility === 'invite') {
+            targetSession.ws.send(
+              JSON.stringify({
+                type: 'hosting_update',
+                username: currentName,
+                hosting: getHostingInfo(hostSession),
+              })
+            );
+          }
+          results.push({ username: targetCanonical, status: 'delivered' });
+        } else {
+          results.push({ username: targetCanonical, status: 'queued' });
+        }
+      }
+
+      send({ type: 'invite_ack', sid, results });
+      return;
+    }
+
+    if (type === 'invite_revoke') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const lowerHost = currentName.toLowerCase();
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      if (!activeSid || activeSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      const hostSession = activeHostSessions.get(sid);
+      if (!hostSession) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      const to = msg.to;
+      if (typeof to !== 'string' || (to !== '*' && !isValidUsername(to))) {
+        send({ type: 'error', code: 'invalid', message: 'to must be "*" or a valid username' });
+        return;
+      }
+
+      if (to === '*') {
+        const keysToRemove = [];
+        for (const [key, invite] of activeInvites.entries()) {
+          if (invite.sid === sid) {
+            keysToRemove.push(key);
+            sendToUser(invite.to, {
+              type: 'invite_cancelled',
+              sid,
+              from: currentName,
+              reason: 'revoked',
+            });
+            if (hostSession.visibility === 'invite') {
+              sendToUser(invite.to, {
+                type: 'hosting_update',
+                username: currentName,
+                hosting: null,
+              });
+            }
+          }
+        }
+        for (const k of keysToRemove) {
+          activeInvites.delete(k);
+        }
+      } else {
+        const inviteKey = `${sid}:${to.toLowerCase()}`;
+        const invite = activeInvites.get(inviteKey);
+        if (invite) {
+          activeInvites.delete(inviteKey);
+          sendToUser(invite.to, {
+            type: 'invite_cancelled',
+            sid,
+            from: currentName,
+            reason: 'revoked',
+          });
+          if (hostSession.visibility === 'invite') {
+            sendToUser(invite.to, {
+              type: 'hosting_update',
+              username: currentName,
+              hosting: null,
+            });
+          }
+        }
+      }
+      return;
+    }
+
+    if (type === 'ask_join') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const host = typeof msg.host === 'string' ? msg.host.trim() : '';
+
+      if (!sid || !isValidUsername(host)) {
+        send({ type: 'error', code: 'invalid', message: 'sid and host must be valid' });
+        return;
+      }
+
+      if (!areFriends(currentName, host)) {
+        send({ type: 'error', code: 'not_friends', message: 'Only accepted friends can ask to join' });
+        return;
+      }
+
+      const hostSid = hostUserToSid.get(host.toLowerCase());
+      if (!hostSid || hostSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'Host does not have an active session with this sid' });
+        return;
+      }
+
+      const hostSession = activeHostSessions.get(sid);
+      if (!hostSession) {
+        send({ type: 'error', code: 'no_session', message: 'Host does not have an active session with this sid' });
+        return;
+      }
+
+      // Rule 6: ask_join: allowed when the session visibility is "ask"
+      if (hostSession.visibility !== 'ask') {
+        send({ type: 'error', code: 'invalid', message: 'Session visibility is not "ask"' });
+        return;
+      }
+
+      sendToUser(host, {
+        type: 'ask_join_in',
+        sid,
+        from: currentName,
+      });
+      return;
+    }
+
+    if (type === 'ask_reply') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const to = typeof msg.to === 'string' ? msg.to.trim() : '';
+      const accept = msg.accept;
+      const lowerHost = currentName.toLowerCase();
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      if (!activeSid || activeSid !== sid) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      const hostSession = activeHostSessions.get(sid);
+      if (!hostSession) {
+        send({ type: 'error', code: 'no_session', message: 'No active hosting session with this sid' });
+        return;
+      }
+
+      if (!isValidUsername(to)) {
+        send({ type: 'error', code: 'invalid', message: 'Invalid recipient username' });
+        return;
+      }
+
+      if (typeof accept !== 'boolean') {
+        send({ type: 'error', code: 'invalid', message: 'accept must be a boolean' });
+        return;
+      }
+
+      const targetCanonical = getCanonicalUsername(to);
+      if (!areFriends(currentName, targetCanonical)) {
+        send({ type: 'error', code: 'not_friends', message: 'User is not an accepted friend' });
+        return;
+      }
+
+      if (accept) {
+        const now = Date.now();
+        const expires = now + 600 * 1000;
+        const inviteKey = `${sid}:${targetCanonical.toLowerCase()}`;
+        const inviteObj = {
+          sid,
+          from: currentName,
+          to: targetCanonical,
+          world: hostSession.world,
+          address: hostSession.address,
+          mcVersion: hostSession.mcVersion,
+          players: hostSession.players,
+          maxPlayers: hostSession.maxPlayers,
+          onlineMode: hostSession.onlineMode,
+          expires,
+        };
+        activeInvites.set(inviteKey, inviteObj);
+
+        const targetSession = getSessionByUsername(targetCanonical);
+        if (targetSession && targetSession.ws.readyState === 1) {
+          targetSession.ws.send(
+            JSON.stringify({
+              type: 'invite_in',
+              sid,
+              from: currentName,
+              world: hostSession.world,
+              address: hostSession.address,
+              mcVersion: hostSession.mcVersion,
+              players: hostSession.players,
+              maxPlayers: hostSession.maxPlayers,
+              onlineMode: hostSession.onlineMode,
+              expires,
+            })
+          );
+          if (hostSession.visibility === 'invite') {
+            targetSession.ws.send(
+              JSON.stringify({
+                type: 'hosting_update',
+                username: currentName,
+                hosting: getHostingInfo(hostSession),
+              })
+            );
+          }
+        }
+      } else {
+        sendToUser(targetCanonical, {
+          type: 'ask_declined',
+          sid,
+          by: currentName,
+        });
+      }
+      return;
+    }
+
+    if (type === 'join_intent') {
+      const sid = msg.sid;
+      if (typeof sid !== 'string' || !/^[a-z0-9]{12}$/.test(sid)) {
+        send({ type: 'error', code: 'invalid', message: 'sid must be 12 characters [a-z0-9]' });
+        return;
+      }
+
+      pruneExpiredIntents();
+      joinIntents.push({
+        username: currentName.toLowerCase(),
+        sid,
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    if (type === 'verify_join') {
+      const sid = typeof msg.sid === 'string' ? msg.sid : '';
+      const name = typeof msg.name === 'string' ? msg.name.trim() : '';
+      const lowerHost = currentName.toLowerCase();
+
+      if (!sid || !name) {
+        send({ type: 'error', code: 'invalid', message: 'sid and name are required' });
+        return;
+      }
+
+      const activeSid = hostUserToSid.get(lowerHost);
+      const isHost = Boolean(activeSid && activeSid === sid);
+
+      pruneExpiredIntents();
+      const now = Date.now();
+      const lowerCheck = name.toLowerCase();
+
+      const hasIntent = joinIntents.some(
+        (intent) => intent.sid === sid && intent.username === lowerCheck && now - intent.timestamp <= JOIN_INTENT_TTL_MS
+      );
+
+      send({
+        type: 'verify_result',
+        sid,
+        name,
+        ok: isHost && hasIntent,
+      });
+      return;
+    }
+
+    // Rule 10: Unknown message types must be ignored with a log line
+    console.log(`[Relay] Ignored unknown message type: "${type}" from ${currentName}`);
   });
 
   const cleanupSession = () => {
@@ -947,6 +1676,7 @@ wss.on('connection', (ws) => {
       }
       broadcastFriendUpdate(canonicalUser, false, null);
       endTrackingSessionsForUser(canonicalUser);
+      stopHostSession(canonicalUser, 'host_offline');
     }
   };
 
@@ -970,13 +1700,18 @@ setInterval(() => {
         }
         broadcastFriendUpdate(canonicalUser, false, null);
         endTrackingSessionsForUser(canonicalUser);
+        stopHostSession(canonicalUser, 'host_offline');
       }
     }
   }
 }, 10000);
 
-// Prune inactive track sessions every 5 seconds (30s timeout)
-setInterval(pruneExpiredTrackSessions, 5000);
+// Prune inactive track sessions, expired invites, and intents every 5 seconds
+setInterval(() => {
+  pruneExpiredTrackSessions();
+  pruneExpiredInvites();
+  pruneExpiredIntents();
+}, 5000);
 
 // Prune expired DMs hourly
 setInterval(pruneExpiredDms, 60 * 60 * 1000);
